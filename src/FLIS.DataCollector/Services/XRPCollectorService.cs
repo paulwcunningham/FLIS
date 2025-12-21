@@ -21,8 +21,26 @@ public sealed class XRPCollectorService : BackgroundService
 
     private long _lastProcessedLedger;
 
-    // XRP price in USD
-    private const decimal XRP_PRICE_USD = 2.20m;
+    // Token prices in USD (simplified - in production would use price oracle)
+    private static readonly Dictionary<string, decimal> TokenPricesUsd = new()
+    {
+        { "XRP", 2.20m },
+        { "BTC", 100_000m },
+        { "BCH", 400m },
+        { "ETH", 3_500m },
+        { "524C555344000000000000000000000000000000", 1.0m }, // RLUSD (stablecoin)
+        { "USD", 1.0m },
+        { "USDT", 1.0m },
+        { "USDC", 1.0m },
+    };
+
+    private decimal GetTokenPriceUsd(string currency)
+    {
+        if (TokenPricesUsd.TryGetValue(currency, out var price))
+            return price;
+        // Default: assume it's a low-value token
+        return 0.001m;
+    }
 
     public XRPCollectorService(
         IOptions<BlockchainConfig> blockchainConfig,
@@ -233,11 +251,18 @@ public sealed class XRPCollectorService : BackgroundService
             if (startCurrency != endCurrency)
                 return null; // Not a circular arbitrage
 
-            // Calculate profit
+            // Calculate profit in USD
             var startAmount = tradeSteps[0].FromAmount;
             var endAmount = CalculateEndAmount(tradeSteps);
-            var profit = endAmount - startAmount;
-            var profitAfterFees = profit - (totalFees * XRP_PRICE_USD);
+            var profitInTokens = endAmount - startAmount;
+
+            // Convert profit to USD based on starting currency
+            var tokenPriceUsd = GetTokenPriceUsd(startCurrency);
+            var profitUsd = profitInTokens * tokenPriceUsd;
+
+            // Deduct transaction fees (fees are always in XRP)
+            var feesUsd = totalFees * GetTokenPriceUsd("XRP");
+            var profitAfterFees = profitUsd - feesUsd;
 
             // Use first transaction hash as identifier
             var txHash = offerTxs[0].Hash ?? Guid.NewGuid().ToString();
@@ -288,7 +313,7 @@ public sealed class XRPCollectorService : BackgroundService
             ProfitAmount = arbTx.ProfitAmount,
             GasUsed = 0, // XRP uses fixed fees, not gas
             GasPriceGwei = 0,
-            EffectiveGasCostUsd = arbTx.TransactionCostXRP * XRP_PRICE_USD,
+            EffectiveGasCostUsd = arbTx.TransactionCostXRP * GetTokenPriceUsd("XRP"),
             IsProfitable = arbTx.IsProfitable
         };
     }
@@ -348,15 +373,14 @@ public sealed class XRPCollectorService : BackgroundService
 
     private decimal CalculateEndAmount(List<XRPTradeStep> steps)
     {
-        // Trace through the trade sequence
-        var amount = steps[0].FromAmount;
+        // For circular arbitrage, we need to trace through actual amounts traded
+        // The end amount should be in the same currency as the start
+        // Use the ToAmount of the last step (which should be in the starting currency)
+        if (steps.Count == 0) return 0;
 
-        foreach (var step in steps)
-        {
-            amount = amount * step.ExchangeRate;
-        }
-
-        return amount;
+        // For a proper circular arbitrage, the last trade's output should equal what we get back
+        // In the ideal case: A -> B -> C -> A, the last ToAmount is what we receive back in A
+        return steps[^1].ToAmount;
     }
 
     private async Task<T?> SendRpcRequestAsync<T>(object request, CancellationToken ct)
