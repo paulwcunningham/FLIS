@@ -199,7 +199,8 @@ public class PatternRecognitionService : BackgroundService
         // Calculate cluster statistics
         var totalTrades = clusterFeatures.Count;
         var profitableTrades = clusterFeatures.Count(f => f.IsProfitable);
-        var successRate = totalTrades > 0 ? (decimal)profitableTrades / totalTrades : 0;
+        // Cap success rate to 0.9999 to fit NUMERIC(5,4) field
+        var successRate = totalTrades > 0 ? Math.Min(0.9999m, (decimal)profitableTrades / totalTrades) : 0;
         var avgProfit = clusterFeatures.Average(f => f.NetProfitUsd);
         var totalProfit = clusterFeatures.Sum(f => f.NetProfitUsd);
 
@@ -259,7 +260,7 @@ public class PatternRecognitionService : BackgroundService
             SuccessRate = successRate,
             AvgProfitUsd = (decimal)avgProfit,
             TotalProfitUsd = (decimal)totalProfit,
-            IsActive = successRate > 0.5m && totalTrades >= 10
+            IsActive = successRate >= 0.5m && totalTrades >= 5
         };
 
         await db.Patterns.AddAsync(pattern, ct);

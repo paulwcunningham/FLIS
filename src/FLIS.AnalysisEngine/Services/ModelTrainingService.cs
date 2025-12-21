@@ -77,7 +77,22 @@ public class ModelTrainingService : BackgroundService
             return;
         }
 
-        _logger.LogInformation("[ModelTraining] Training models with {Count} samples", features.Count);
+        // Check for sufficient positive and negative samples for binary classification
+        var positiveCount = features.Count(f => f.IsProfitable);
+        var negativeCount = features.Count - positiveCount;
+
+        // Need at least 10 of each class to train effectively
+        const int minClassSamples = 10;
+        if (positiveCount < minClassSamples || negativeCount < minClassSamples)
+        {
+            _logger.LogInformation(
+                "[ModelTraining] Imbalanced data - need at least {Min} of each class. Positive: {Pos}, Negative: {Neg}",
+                minClassSamples, positiveCount, negativeCount);
+            return;
+        }
+
+        _logger.LogInformation("[ModelTraining] Training models with {Count} samples (Positive: {Pos}, Negative: {Neg})",
+            features.Count, positiveCount, negativeCount);
 
         // Convert to ML.NET training data
         var trainingData = features.Select(f => new TrainingFeature
@@ -124,8 +139,9 @@ public class ModelTrainingService : BackgroundService
     {
         var dataView = _mlContext.Data.LoadFromEnumerable(data);
 
-        // Split data
-        var split = _mlContext.Data.TrainTestSplit(dataView, testFraction: 0.2);
+        // Stratified split to ensure both classes are in train and test sets
+        var split = _mlContext.Data.TrainTestSplit(dataView, testFraction: 0.2,
+            samplingKeyColumnName: "IsProfitable");
 
         // Build pipeline
         var pipeline = _mlContext.Transforms.Categorical.OneHotEncoding("ProtocolEncoded", "Protocol")
@@ -145,9 +161,34 @@ public class ModelTrainingService : BackgroundService
         // Train
         var model = pipeline.Fit(split.TrainSet);
 
-        // Evaluate
+        // Evaluate with error handling for edge cases
         var predictions = model.Transform(split.TestSet);
-        var metrics = _mlContext.BinaryClassification.Evaluate(predictions, labelColumnName: "IsProfitable");
+        double accuracy = 0;
+        double auc = 0;
+        double f1 = 0;
+
+        try
+        {
+            var metrics = _mlContext.BinaryClassification.Evaluate(predictions, labelColumnName: "IsProfitable");
+            accuracy = metrics.Accuracy;
+            auc = double.IsNaN(metrics.AreaUnderRocCurve) ? 0 : metrics.AreaUnderRocCurve;
+            f1 = double.IsNaN(metrics.F1Score) ? 0 : metrics.F1Score;
+        }
+        catch (ArgumentOutOfRangeException ex) when (ex.ParamName == "PosSample" || ex.ParamName == "NegSample")
+        {
+            // This happens when test set has no positive or negative samples
+            _logger.LogWarning("[ModelTraining] Could not calculate all metrics due to data distribution: {Message}", ex.Message);
+            // Use cross-validation metrics instead
+            var cvResults = _mlContext.BinaryClassification.CrossValidate(
+                _mlContext.Data.LoadFromEnumerable(data),
+                pipeline,
+                numberOfFolds: 5,
+                labelColumnName: "IsProfitable");
+            accuracy = cvResults.Average(r => r.Metrics.Accuracy);
+            auc = cvResults.Average(r => double.IsNaN(r.Metrics.AreaUnderRocCurve) ? 0 : r.Metrics.AreaUnderRocCurve);
+            f1 = cvResults.Average(r => double.IsNaN(r.Metrics.F1Score) ? 0 : r.Metrics.F1Score);
+            _logger.LogInformation("[ModelTraining] Used cross-validation metrics instead");
+        }
 
         // Save model
         var modelPath = Path.Combine(_modelSettings.ModelsDirectory, _modelSettings.ProfitabilityClassifierFile);
@@ -155,9 +196,9 @@ public class ModelTrainingService : BackgroundService
 
         _logger.LogInformation("[ModelTraining] Profitability classifier saved to {Path}", modelPath);
         _logger.LogInformation("[ModelTraining] Classifier metrics - Accuracy: {Accuracy:P2}, AUC: {AUC:F4}, F1: {F1:F4}",
-            metrics.Accuracy, metrics.AreaUnderRocCurve, metrics.F1Score);
+            accuracy, auc, f1);
 
-        return (metrics.Accuracy, metrics.AreaUnderRocCurve);
+        return (accuracy, auc);
     }
 
     private async Task<(double rSquared, double mae)> TrainProfitPredictorAsync(
@@ -265,3 +306,4 @@ public class TrainingFeature
     [ColumnName("NetProfitUsd")]
     public float NetProfitUsd { get; set; }
 }
+
