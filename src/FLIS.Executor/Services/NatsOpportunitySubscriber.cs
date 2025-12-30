@@ -36,23 +36,46 @@ public class NatsOpportunitySubscriber : BackgroundService
 
         _logger.LogInformation("Connected to NATS at {Url}, subscribing to {Subject}", _natsUrl, _subject);
 
+        // Pass the NATS connection to TransactionManager so it can publish results
+        _transactionManager.SetNatsConnection(_connection);
+
         var subscription = _connection.SubscribeAsync(_subject, async (sender, args) =>
         {
             try
             {
                 var json = Encoding.UTF8.GetString(args.Message.Data);
-                var opportunity = JsonSerializer.Deserialize<FlashLoanOpportunity>(json);
+                _logger.LogDebug("Received NATS message: {Json}", json);
+
+                var options = new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                };
+
+                var opportunity = JsonSerializer.Deserialize<FlashLoanOpportunity>(json, options);
 
                 if (opportunity != null)
                 {
+                    _logger.LogInformation(
+                        "Processing opportunity {Id}: {Strategy} on {Chain}",
+                        opportunity.Id,
+                        opportunity.Strategy,
+                        opportunity.ChainName
+                    );
+
                     await _transactionManager.ProcessOpportunityAsync(opportunity);
+                }
+                else
+                {
+                    _logger.LogWarning("Failed to deserialize opportunity from NATS message");
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error processing NATS message");
+                _logger.LogError(ex, "Error processing NATS message: {Message}", ex.Message);
             }
         });
+
+        _logger.LogInformation("Subscription active, waiting for opportunities...");
 
         await Task.Delay(Timeout.Infinite, stoppingToken);
     }
