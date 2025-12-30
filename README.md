@@ -47,11 +47,78 @@ dotnet run
 
 ```
 FLIS/
+├── FLIS.sln                # Solution file
 ├── docker-compose.yml      # Database container configuration
+├── deploy-executor.sh      # Deployment script for FLIS.Executor
 ├── db/
 │   └── init_db.sql        # Database schema initialization
 └── src/
-    └── FLIS.DataCollector/ # .NET Worker Service
+    ├── FLIS.DataCollector/ # .NET Worker Service for data collection
+    └── FLIS.Executor/      # Flash Loan Execution Engine
+        ├── Models/         # Data models
+        ├── Services/       # Core services
+        │   ├── MultiChainRpcProvider.cs
+        │   ├── GasBiddingService.cs
+        │   ├── SimulationService.cs
+        │   ├── TransactionManager.cs
+        │   └── NatsOpportunitySubscriber.cs
+        ├── Program.cs      # Application entry point
+        └── appsettings.json # Configuration
+```
+
+## Components
+
+### FLIS.Executor
+
+The execution engine for flash loan arbitrage opportunities. This service:
+
+- **Subscribes to NATS** for flash loan opportunities from the Magnus platform
+- **Multi-chain support** for Ethereum, Base, Arbitrum, and other EVM chains
+- **ML-powered gas bidding** via integration with MLOptimizer service
+- **Transaction simulation** to verify profitability before execution
+- **Secure transaction signing** with private key management
+- **Real-time execution** of profitable flash loan arbitrage
+
+#### Architecture
+
+```
+NATS (Opportunities) → Executor → Gas Bidding (ML) → Simulation → Transaction Signing → On-chain Execution
+```
+
+#### Deployment
+
+Deploy the executor service:
+
+```bash
+sudo ./deploy-executor.sh
+```
+
+This will:
+1. Build the application
+2. Create a systemd service
+3. Configure automatic restart on failure
+
+**Important:** Before starting, configure:
+- NATS server URL
+- Multi-chain RPC endpoints
+- Smart contract addresses and ABIs
+- Executor wallet private key (use secrets manager in production)
+- MLOptimizer API endpoint
+
+#### Service Management
+
+```bash
+# Start the service
+sudo systemctl start flis-executor
+
+# Check status
+sudo systemctl status flis-executor
+
+# View logs
+sudo journalctl -u flis-executor -f
+
+# Stop the service
+sudo systemctl stop flis-executor
 ```
 
 ## License
