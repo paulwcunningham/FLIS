@@ -1,0 +1,17 @@
+version: '3.8'
+services:
+  db:
+    image: timescale/timescaledb:latest-pg14
+    container_name: flis_db
+    environment:
+      - POSTGRES_USER=flis_user
+      - POSTGRES_PASSWORD=flis_password
+      - POSTGRES_DB=flis_data
+    ports:
+      - "5433:5432"
+    volumes:
+      - flis_db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  flis_db_data:
