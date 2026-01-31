@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using NATS.Client;
 using FLIS.Executor.Models;
+using FLIS.Executor.Services.MEV;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -23,50 +24,53 @@ public class TransactionManager : ITransactionManager
     private readonly IMultiChainRpcProvider _rpcProvider;
     private readonly IGasBiddingService _gasBiddingService;
     private readonly ISimulationService _simulationService;
+    private readonly IResultPublisher _resultPublisher;
+    private readonly IMevCoordinator _mevCoordinator;
     private readonly IConfiguration _configuration;
     private readonly ILogger<TransactionManager> _logger;
     private readonly string _privateKey;
-    private IConnection? _natsConnection;
+
+    // Timing tracking for latency metrics
+    private long _opportunityReceivedAt;
+    private long _simulationStartedAt;
+    private long _simulationCompletedAt;
+    private long _transactionSubmittedAt;
 
     public TransactionManager(
         IMultiChainRpcProvider rpcProvider,
         IGasBiddingService gasBiddingService,
         ISimulationService simulationService,
+        IResultPublisher resultPublisher,
+        IMevCoordinator mevCoordinator,
         IConfiguration configuration,
         ILogger<TransactionManager> logger)
     {
         _rpcProvider = rpcProvider;
         _gasBiddingService = gasBiddingService;
         _simulationService = simulationService;
+        _resultPublisher = resultPublisher;
+        _mevCoordinator = mevCoordinator;
         _configuration = configuration;
         _logger = logger;
 
         // In production, retrieve from AWS Secrets Manager
         _privateKey = configuration["ExecutorWallet:PrivateKey"]
             ?? throw new InvalidOperationException("Executor private key not configured");
-
-        // Initialize NATS connection
-        try
-        {
-            var natsUrl = configuration["Nats:Url"];
-            if (!string.IsNullOrEmpty(natsUrl))
-            {
-                var factory = new ConnectionFactory();
-                _natsConnection = factory.CreateConnection(natsUrl);
-                _logger.LogInformation("Connected to NATS at {Url}", natsUrl);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to connect to NATS - results will not be published");
-        }
     }
 
     public async Task ProcessOpportunityAsync(FlashLoanOpportunity opportunity)
     {
+        _opportunityReceivedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+        
         _logger.LogInformation(
-            "Processing opportunity {Id} on {Chain}: {Strategy} {Asset} {Amount}",
-            opportunity.Id, opportunity.ChainName, opportunity.Strategy, opportunity.Asset, opportunity.Amount);
+            "Processing opportunity {Id} on {Chain}: {Strategy} {Asset} {Amount}, AOI={AOI:F2}, Confidence={Conf:F2}",
+            opportunity.Id, opportunity.ChainName, opportunity.Strategy, 
+            opportunity.Asset, opportunity.Amount,
+            opportunity.AoiScore ?? 0, opportunity.ConfidenceScore);
+
+        // Publish status update
+        await _resultPublisher.PublishStatusUpdateAsync(new FlashLoanStatusUpdate(
+            opportunity.Id, "received", DateTime.UtcNow, null));
 
         try
         {
@@ -76,40 +80,194 @@ public class TransactionManager : ITransactionManager
                 gasBid.GasPriceGwei, gasBid.GasLimit, gasBid.EstimatedCostUsd);
 
             // 2. Simulate the trade to confirm profitability
+            await _resultPublisher.PublishStatusUpdateAsync(new FlashLoanStatusUpdate(
+                opportunity.Id, "simulating", DateTime.UtcNow, null));
+            
+            _simulationStartedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
             var (isProfitable, estimatedProfit) = await _simulationService.SimulateAsync(opportunity, gasBid);
+            _simulationCompletedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+            
             if (!isProfitable)
             {
                 _logger.LogWarning("Skipping unprofitable opportunity on {Chain}. Estimated profit: {Profit:C}",
                     opportunity.ChainName, estimatedProfit);
 
-                // Publish negative result to NATS
-                await PublishResultAsync(new FlashLoanResult(
-                    OpportunityId: opportunity.Id,
-                    ChainName: opportunity.ChainName,
-                    Strategy: opportunity.Strategy,
-                    Asset: opportunity.Asset,
-                    Amount: opportunity.Amount,
-                    Success: false,
-                    Reason: "Unprofitable after gas costs",
-                    TransactionHash: null,
-                    GasUsed: null,
-                    GasPrice: null,
-                    ActualCostUsd: null,
-                    Timestamp: DateTime.UtcNow
-                ));
-
+                await PublishEnhancedResultAsync(opportunity, gasBid, false, 
+                    "Unprofitable after gas costs", null, null, estimatedProfit, null);
                 return;
             }
 
             _logger.LogInformation("Opportunity is profitable: {Profit:C} USD", estimatedProfit);
 
-            // 3. Get the right RPC provider and account
+            // 3. Check if we should use MEV
+            if (opportunity.UseMev && _mevCoordinator.IsMevAvailable(opportunity.ChainName))
+            {
+                await ProcessWithMevAsync(opportunity, gasBid, estimatedProfit);
+            }
+            else
+            {
+                await ProcessStandardAsync(opportunity, gasBid, estimatedProfit);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to process opportunity {Id} on {Chain}",
+                opportunity.Id, opportunity.ChainName);
+
+            await PublishEnhancedResultAsync(opportunity, null, false, ex.Message, null, null, null, null);
+        }
+    }
+
+    private async Task ProcessWithMevAsync(FlashLoanOpportunity opportunity, GasBid gasBid, decimal estimatedProfit)
+    {
+        _logger.LogInformation("Processing opportunity {Id} via MEV ({Provider})",
+            opportunity.Id, opportunity.PreferredMevProvider ?? "auto");
+
+        await _resultPublisher.PublishStatusUpdateAsync(new FlashLoanStatusUpdate(
+            opportunity.Id, "submitting_mev", DateTime.UtcNow, 
+            $"Provider: {opportunity.PreferredMevProvider ?? "auto"}"));
+
+        // Build the transaction(s)
+        var transactions = await BuildTransactionsAsync(opportunity, gasBid);
+        
+        if (transactions == null || transactions.Count == 0)
+        {
+            await PublishEnhancedResultAsync(opportunity, gasBid, false,
+                "Failed to build transactions", null, null, estimatedProfit, null);
+            return;
+        }
+
+        _transactionSubmittedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+
+        // Execute via MEV coordinator
+        var mevResult = await _mevCoordinator.ExecuteWithMevAsync(opportunity, transactions);
+
+        var confirmedAt = mevResult.ConfirmedAtNanos;
+
+        // Publish enhanced result
+        await PublishEnhancedResultAsync(
+            opportunity, gasBid, mevResult.Success, mevResult.Reason,
+            mevResult.TransactionHashes.FirstOrDefault(),
+            mevResult.BlockNumber.HasValue ? (long?)mevResult.BlockNumber.Value : null,
+            estimatedProfit, mevResult.ProfitRealized,
+            mevProvider: mevResult.Provider,
+            bundleId: mevResult.BundleId,
+            mevTipPaid: mevResult.TipPaid,
+            wasFrontrun: mevResult.WasFrontrun,
+            wasBackrun: mevResult.WasBackrun,
+            confirmedAtNanos: confirmedAt);
+    }
+
+    private async Task ProcessStandardAsync(FlashLoanOpportunity opportunity, GasBid gasBid, decimal estimatedProfit)
+    {
+        await _resultPublisher.PublishStatusUpdateAsync(new FlashLoanStatusUpdate(
+            opportunity.Id, "submitting", DateTime.UtcNow, null));
+
+        // Get the right RPC provider and account
+        var web3 = _rpcProvider.GetWeb3(opportunity.ChainName);
+        var nodeConfig = _rpcProvider.GetNodeConfig(opportunity.ChainName);
+        var account = new Account(_privateKey, nodeConfig.ChainId);
+        var web3WithAccount = new Web3(account, web3.Client);
+
+        // Get the contract configuration
+        var contractConfigs = _configuration.GetSection("SmartContracts")
+            .Get<List<SmartContractConfig>>();
+
+        var contractConfig = contractConfigs?
+            .FirstOrDefault(c => c.ChainName == opportunity.ChainName);
+
+        if (contractConfig == null)
+        {
+            _logger.LogError("No contract configuration found for chain {ChainName}", opportunity.ChainName);
+            await PublishEnhancedResultAsync(opportunity, gasBid, false,
+                "No contract configuration found", null, null, estimatedProfit, null);
+            return;
+        }
+
+        var contract = web3WithAccount.Eth.GetContract(contractConfig.Abi, contractConfig.ContractAddress);
+
+        // Build and sign the transaction
+        var (function, parameters) = BuildFunctionCall(opportunity, contract);
+        
+        if (function == null)
+        {
+            await PublishEnhancedResultAsync(opportunity, gasBid, false,
+                "Unknown strategy or missing parameters", null, null, estimatedProfit, null);
+            return;
+        }
+
+        // Convert gas price from Gwei to Wei
+        var gasPriceWei = Web3.Convert.ToWei(gasBid.GasPriceGwei, Nethereum.Util.UnitConversion.EthUnit.Gwei);
+
+        // Create transaction input
+        var transactionInput = function.CreateTransactionInput(
+            account.Address,
+            new HexBigInteger(gasBid.GasLimit),
+            new HexBigInteger(gasPriceWei),
+            new HexBigInteger(0),
+            parameters!
+        );
+
+        // Submit the transaction
+        _logger.LogInformation("Submitting transaction to {ChainName}...", opportunity.ChainName);
+        _transactionSubmittedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+
+        var txHash = await web3WithAccount.Eth.Transactions.SendTransaction.SendRequestAsync(transactionInput);
+        _logger.LogInformation("Transaction submitted: {TxHash}", txHash);
+
+        await _resultPublisher.PublishStatusUpdateAsync(new FlashLoanStatusUpdate(
+            opportunity.Id, "pending", DateTime.UtcNow, txHash));
+
+        // Wait for transaction receipt
+        var receipt = await WaitForReceiptAsync(web3, txHash);
+        var confirmedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+
+        if (receipt == null)
+        {
+            _logger.LogWarning("Transaction receipt not available: {TxHash}", txHash);
+            await PublishEnhancedResultAsync(opportunity, gasBid, false,
+                "Receipt timeout", txHash, null, estimatedProfit, null);
+            return;
+        }
+
+        // Check if transaction succeeded
+        var success = receipt.Status?.Value == 1;
+        var gasUsed = (long)receipt.GasUsed.Value;
+        var actualCostUsd = gasBid.EstimatedCostUsd * ((decimal)gasUsed / gasBid.GasLimit);
+
+        if (success)
+        {
+            _logger.LogInformation(
+                "Transaction successful: {TxHash}, Gas Used: {GasUsed}, Cost: {Cost:C}",
+                txHash, gasUsed, actualCostUsd);
+        }
+        else
+        {
+            _logger.LogError("Transaction failed: {TxHash}", txHash);
+        }
+
+        await PublishEnhancedResultAsync(
+            opportunity, gasBid, success,
+            success ? null : "Transaction reverted",
+            txHash, (long)receipt.BlockNumber.Value,
+            estimatedProfit, success ? estimatedProfit - actualCostUsd : 0,
+            gasUsed: gasUsed,
+            gasPriceWei: gasPriceWei.ToString(),
+            actualCostUsd: actualCostUsd,
+            blockHash: receipt.BlockHash,
+            transactionIndex: (int)receipt.TransactionIndex.Value,
+            confirmedAtNanos: confirmedAt);
+    }
+
+    private async Task<List<string>?> BuildTransactionsAsync(FlashLoanOpportunity opportunity, GasBid gasBid)
+    {
+        try
+        {
             var web3 = _rpcProvider.GetWeb3(opportunity.ChainName);
             var nodeConfig = _rpcProvider.GetNodeConfig(opportunity.ChainName);
             var account = new Account(_privateKey, nodeConfig.ChainId);
             var web3WithAccount = new Web3(account, web3.Client);
 
-            // 4. Get the contract configuration
             var contractConfigs = _configuration.GetSection("SmartContracts")
                 .Get<List<SmartContractConfig>>();
 
@@ -118,229 +276,221 @@ public class TransactionManager : ITransactionManager
 
             if (contractConfig == null)
             {
-                _logger.LogError("No contract configuration found for chain {ChainName}", opportunity.ChainName);
-
-                await PublishResultAsync(new FlashLoanResult(
-                    OpportunityId: opportunity.Id,
-                    ChainName: opportunity.ChainName,
-                    Strategy: opportunity.Strategy,
-                    Asset: opportunity.Asset,
-                    Amount: opportunity.Amount,
-                    Success: false,
-                    Reason: "No contract configuration found",
-                    TransactionHash: null,
-                    GasUsed: null,
-                    GasPrice: null,
-                    ActualCostUsd: null,
-                    Timestamp: DateTime.UtcNow
-                ));
-
-                return;
+                return null;
             }
 
             var contract = web3WithAccount.Eth.GetContract(contractConfig.Abi, contractConfig.ContractAddress);
+            var (function, parameters) = BuildFunctionCall(opportunity, contract);
 
-            // 5. Build and sign the transaction
-            Function function;
-            object[] parameters;
-
-            if (opportunity.Strategy == "CrossDex" && opportunity.SourceDex != null && opportunity.TargetDex != null)
+            if (function == null || parameters == null)
             {
-                function = contract.GetFunction("executeCrossDexArbitrage");
-                parameters = new object[]
-                {
-                    opportunity.Asset,
-                    Web3.Convert.ToWei(opportunity.Amount),
-                    opportunity.SourceDex,
-                    opportunity.TargetDex,
-                    Web3.Convert.ToWei(opportunity.MinProfit)
-                };
-            }
-            else if (opportunity.Strategy == "MultiHop" && opportunity.Path != null)
-            {
-                function = contract.GetFunction("executeMultiHopArbitrage");
-                parameters = new object[]
-                {
-                    opportunity.Asset,
-                    Web3.Convert.ToWei(opportunity.Amount),
-                    opportunity.Path.Split(','),
-                    Web3.Convert.ToWei(opportunity.MinProfit)
-                };
-            }
-            else
-            {
-                _logger.LogWarning("Unknown strategy or missing parameters: {Strategy}", opportunity.Strategy);
-
-                await PublishResultAsync(new FlashLoanResult(
-                    OpportunityId: opportunity.Id,
-                    ChainName: opportunity.ChainName,
-                    Strategy: opportunity.Strategy,
-                    Asset: opportunity.Asset,
-                    Amount: opportunity.Amount,
-                    Success: false,
-                    Reason: "Unknown strategy or missing parameters",
-                    TransactionHash: null,
-                    GasUsed: null,
-                    GasPrice: null,
-                    ActualCostUsd: null,
-                    Timestamp: DateTime.UtcNow
-                ));
-
-                return;
+                return null;
             }
 
-            // Convert gas price from Gwei to Wei
             var gasPriceWei = Web3.Convert.ToWei(gasBid.GasPriceGwei, Nethereum.Util.UnitConversion.EthUnit.Gwei);
 
-            // Create transaction input
             var transactionInput = function.CreateTransactionInput(
                 account.Address,
                 new HexBigInteger(gasBid.GasLimit),
                 new HexBigInteger(gasPriceWei),
-                new HexBigInteger(0), // value
+                new HexBigInteger(0),
                 parameters
             );
 
-            // 6. Submit the transaction
-            _logger.LogInformation("Submitting transaction to {ChainName}...", opportunity.ChainName);
+            // Sign the transaction
+            var signedTx = await account.TransactionManager.SignTransactionAsync(transactionInput);
 
-            var txHash = await web3WithAccount.Eth.Transactions.SendTransaction.SendRequestAsync(transactionInput);
-
-            _logger.LogInformation("Transaction submitted: {TxHash}", txHash);
-
-            // 7. Wait for transaction receipt (with timeout)
-            TransactionReceipt? receipt = null;
-            int attempts = 0;
-            const int maxAttempts = 60; // 2 minutes with 2-second intervals
-
-            while (receipt == null && attempts < maxAttempts)
-            {
-                await Task.Delay(2000); // Wait 2 seconds
-                receipt = await web3.Eth.Transactions.GetTransactionReceipt.SendRequestAsync(txHash);
-                attempts++;
-            }
-
-            if (receipt == null)
-            {
-                _logger.LogWarning("Transaction receipt not available after {Seconds} seconds: {TxHash}",
-                    maxAttempts * 2, txHash);
-
-                await PublishResultAsync(new FlashLoanResult(
-                    OpportunityId: opportunity.Id,
-                    ChainName: opportunity.ChainName,
-                    Strategy: opportunity.Strategy,
-                    Asset: opportunity.Asset,
-                    Amount: opportunity.Amount,
-                    Success: false,
-                    Reason: "Receipt timeout",
-                    TransactionHash: txHash,
-                    GasUsed: null,
-                    GasPrice: gasPriceWei.ToString(),
-                    ActualCostUsd: null,
-                    Timestamp: DateTime.UtcNow
-                ));
-
-                return;
-            }
-
-            // 8. Check if transaction succeeded
-            var success = receipt.Status?.Value == 1;
-
-            if (success)
-            {
-                var actualGasCost = Web3.Convert.FromWei(gasPriceWei * receipt.GasUsed.Value);
-                // TODO: Get real-time ETH price for accurate USD cost
-                var actualCostUsd = gasBid.EstimatedCostUsd; // Approximation
-
-                _logger.LogInformation(
-                    "Transaction successful: {TxHash}, Gas Used: {GasUsed}, Cost: {Cost:C}",
-                    txHash,
-                    receipt.GasUsed.Value,
-                    actualCostUsd
-                );
-
-                await PublishResultAsync(new FlashLoanResult(
-                    OpportunityId: opportunity.Id,
-                    ChainName: opportunity.ChainName,
-                    Strategy: opportunity.Strategy,
-                    Asset: opportunity.Asset,
-                    Amount: opportunity.Amount,
-                    Success: true,
-                    Reason: null,
-                    TransactionHash: txHash,
-                    GasUsed: (long)receipt.GasUsed.Value,
-                    GasPrice: gasPriceWei.ToString(),
-                    ActualCostUsd: actualCostUsd,
-                    Timestamp: DateTime.UtcNow
-                ));
-            }
-            else
-            {
-                _logger.LogError("Transaction failed: {TxHash}", txHash);
-
-                await PublishResultAsync(new FlashLoanResult(
-                    OpportunityId: opportunity.Id,
-                    ChainName: opportunity.ChainName,
-                    Strategy: opportunity.Strategy,
-                    Asset: opportunity.Asset,
-                    Amount: opportunity.Amount,
-                    Success: false,
-                    Reason: "Transaction reverted",
-                    TransactionHash: txHash,
-                    GasUsed: (long)receipt.GasUsed.Value,
-                    GasPrice: gasPriceWei.ToString(),
-                    ActualCostUsd: gasBid.EstimatedCostUsd,
-                    Timestamp: DateTime.UtcNow
-                ));
-            }
+            return new List<string> { signedTx };
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to process opportunity {Id} on {Chain}",
-                opportunity.Id, opportunity.ChainName);
-
-            await PublishResultAsync(new FlashLoanResult(
-                OpportunityId: opportunity.Id,
-                ChainName: opportunity.ChainName,
-                Strategy: opportunity.Strategy,
-                Asset: opportunity.Asset,
-                Amount: opportunity.Amount,
-                Success: false,
-                Reason: ex.Message,
-                TransactionHash: null,
-                GasUsed: null,
-                GasPrice: null,
-                ActualCostUsd: null,
-                Timestamp: DateTime.UtcNow
-            ));
+            _logger.LogError(ex, "Failed to build transactions for opportunity {Id}", opportunity.Id);
+            return null;
         }
     }
 
-    private async Task PublishResultAsync(FlashLoanResult result)
+    private (Function?, object[]?) BuildFunctionCall(FlashLoanOpportunity opportunity, Contract contract)
     {
-        try
+        if (opportunity.Strategy == "CrossDex" && opportunity.SourceDex != null && opportunity.TargetDex != null)
         {
-            if (_natsConnection == null)
+            var function = contract.GetFunction("executeCrossDexArbitrage");
+            var parameters = new object[]
             {
-                _logger.LogWarning("NATS connection not available - skipping result publication");
-                return;
-            }
-
-            var json = JsonSerializer.Serialize(result);
-            var data = Encoding.UTF8.GetBytes(json);
-
-            var resultSubject = _configuration["Nats:ResultSubject"]
-                ?? "magnus.results.flashloan";
-
-            _natsConnection.Publish(resultSubject, data);
-
-            _logger.LogInformation(
-                "Published result to NATS: {Subject} - OpportunityId={Id}, Success={Success}",
-                resultSubject, result.OpportunityId, result.Success);
+                opportunity.Asset,
+                Web3.Convert.ToWei(opportunity.Amount),
+                opportunity.SourceDex,
+                opportunity.TargetDex,
+                Web3.Convert.ToWei(opportunity.MinProfit)
+            };
+            return (function, parameters);
         }
-        catch (Exception ex)
+        
+        if (opportunity.Strategy == "MultiHop" && opportunity.Path != null)
         {
-            _logger.LogError(ex, "Failed to publish result to NATS");
+            var function = contract.GetFunction("executeMultiHopArbitrage");
+            var parameters = new object[]
+            {
+                opportunity.Asset,
+                Web3.Convert.ToWei(opportunity.Amount),
+                opportunity.Path.Split(','),
+                Web3.Convert.ToWei(opportunity.MinProfit)
+            };
+            return (function, parameters);
         }
+        
+        if (opportunity.Strategy == "Triangular" && opportunity.Path != null)
+        {
+            var function = contract.GetFunction("executeTriangularArbitrage");
+            var parameters = new object[]
+            {
+                opportunity.Asset,
+                Web3.Convert.ToWei(opportunity.Amount),
+                opportunity.Path.Split(','),
+                Web3.Convert.ToWei(opportunity.MinProfit)
+            };
+            return (function, parameters);
+        }
+        
+        if ((opportunity.Strategy == "JitoMEV" || opportunity.Strategy == "SuaveMEV") && 
+            opportunity.SourceDex != null && opportunity.TargetDex != null)
+        {
+            // MEV strategies use the same cross-dex function but are routed through MEV providers
+            var function = contract.GetFunction("executeCrossDexArbitrage");
+            var parameters = new object[]
+            {
+                opportunity.Asset,
+                Web3.Convert.ToWei(opportunity.Amount),
+                opportunity.SourceDex,
+                opportunity.TargetDex,
+                Web3.Convert.ToWei(opportunity.MinProfit)
+            };
+            return (function, parameters);
+        }
+
+        _logger.LogWarning("Unknown strategy or missing parameters: {Strategy}", opportunity.Strategy);
+        return (null, null);
     }
+
+    private async Task<TransactionReceipt?> WaitForReceiptAsync(Web3 web3, string txHash)
+    {
+        int attempts = 0;
+        const int maxAttempts = 60;
+
+        while (attempts < maxAttempts)
+        {
+            await Task.Delay(2000);
+            var receipt = await web3.Eth.Transactions.GetTransactionReceipt.SendRequestAsync(txHash);
+            if (receipt != null)
+            {
+                return receipt;
+            }
+            attempts++;
+        }
+
+        return null;
+    }
+
+    private async Task PublishEnhancedResultAsync(
+        FlashLoanOpportunity opportunity,
+        GasBid? gasBid,
+        bool success,
+        string? reason,
+        string? txHash,
+        long? blockNumber,
+        decimal? estimatedProfit,
+        decimal? actualProfit,
+        long? gasUsed = null,
+        string? gasPriceWei = null,
+        decimal? actualCostUsd = null,
+        string? mevProvider = null,
+        string? bundleId = null,
+        decimal? mevTipPaid = null,
+        bool wasFrontrun = false,
+        bool wasBackrun = false,
+        string? blockHash = null,
+        int? transactionIndex = null,
+        long? confirmedAtNanos = null)
+    {
+        // Calculate slippage if we have both estimated and actual profit
+        decimal? slippageBps = null;
+        if (estimatedProfit.HasValue && actualProfit.HasValue && estimatedProfit.Value != 0)
+        {
+            slippageBps = ((estimatedProfit.Value - actualProfit.Value) / estimatedProfit.Value) * 10000;
+        }
+
+        var result = new FlashLoanResult(
+            OpportunityId: opportunity.Id,
+            ChainName: opportunity.ChainName,
+            Strategy: opportunity.Strategy,
+            Asset: opportunity.Asset,
+            Amount: opportunity.Amount,
+            Success: success,
+            Reason: reason,
+            TransactionHash: txHash,
+            GasUsed: gasUsed,
+            GasPrice: gasPriceWei,
+            ActualCostUsd: actualCostUsd,
+            Timestamp: DateTime.UtcNow,
+            
+            // Timing metrics
+            OpportunityReceivedAtNanos: _opportunityReceivedAt,
+            SimulationStartedAtNanos: _simulationStartedAt,
+            SimulationCompletedAtNanos: _simulationCompletedAt,
+            TransactionSubmittedAtNanos: _transactionSubmittedAt,
+            TransactionConfirmedAtNanos: confirmedAtNanos,
+            
+            // Profit metrics
+            EstimatedProfitUsd: estimatedProfit,
+            ActualProfitUsd: actualProfit,
+            SlippageBps: slippageBps,
+            
+            // Market context from opportunity
+            SpreadBps: opportunity.SpreadBps,
+            OrderBookImbalance: opportunity.OrderBookImbalance,
+            VolatilityPercent: opportunity.VolatilityPercent,
+            
+            // MEV metrics
+            MevProvider: mevProvider,
+            BundleId: bundleId,
+            BundlePosition: null,
+            MevTipPaid: mevTipPaid,
+            WasFrontrun: wasFrontrun,
+            WasBackrun: wasBackrun,
+            
+            // Source info
+            SourceProtocol: opportunity.SourceDex,
+            TargetProtocol: opportunity.TargetDex,
+            LiquidityProvider: opportunity.LiquidityProvider,
+            PoolLiquidity: null,
+            
+            // Block info
+            BlockNumber: blockNumber,
+            BlockHash: blockHash,
+            TransactionIndex: transactionIndex
+        );
+
+        await _resultPublisher.PublishResultAsync(result);
+
+        // Also publish final status update
+        await _resultPublisher.PublishStatusUpdateAsync(new FlashLoanStatusUpdate(
+            opportunity.Id,
+            success ? "confirmed" : "failed",
+            DateTime.UtcNow,
+            success ? txHash : reason
+        ));
+    }
+}
+
+public class SmartContractConfig
+{
+    public string ChainName { get; set; } = string.Empty;
+    public string ContractAddress { get; set; } = string.Empty;
+    public string Abi { get; set; } = string.Empty;
+}
+
+public class GasBid
+{
+    public decimal GasPriceGwei { get; set; }
+    public long GasLimit { get; set; }
+    public decimal EstimatedCostUsd { get; set; }
 }
